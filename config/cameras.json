@@ -1,0 +1,7 @@
+[
+  {
+    "id": "cam1",
+    "rtsp_url": "rtsp://192.168.3.57:554/s0",
+    "remote_path": "/webcams/img1.jpg"
+  }
+]

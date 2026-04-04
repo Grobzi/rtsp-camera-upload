@@ -1,0 +1,13 @@
+[project]
+name = "mfsg-camera"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "onvif-zeep>=0.2.12",
+    "paramiko>=4.0.0",
+    "pillow>=12.1.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.32.5",
+]
