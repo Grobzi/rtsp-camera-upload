@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Multi-camera snapshot uploader (RTSP -> SFTP/FTPS latest.jpg)
+"""Multi-camera snapshot uploader (RTSP -> FTPS)
 
 Usage: python scripts/upload_snapshot.py --config config/cameras.json
 
-Reads camera list from a JSON file and uploads each camera's latest.jpg
-to the configured remote path over SFTP or FTPS. Uses ffmpeg for RTSP captures.
+Reads camera list from a JSON file and uploads each camera's snapshot
+to the configured remote path over FTPS (explicit TLS). Uses ffmpeg for RTSP captures.
 """
 import argparse
 import json
@@ -20,11 +20,6 @@ from io import BytesIO
 import ssl
 from ftplib import FTP_TLS
 import shutil
-
-try:
-    import paramiko
-except Exception:
-    paramiko = None
 
 try:
     from dotenv import load_dotenv
@@ -55,16 +50,14 @@ def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmp
 
     cmd = [
         cmd_exe,
-        "-rtsp_transport",
-        "tcp",
-        "-i",
-        rtsp_url,
-        "-frames:v",
-        "1",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "mjpeg",
+        "-y",
+        "-rtsp_transport", "tcp",
+        "-probesize", "524288",
+        "-analyzeduration", "1000000",
+        "-i", rtsp_url,
+        "-frames:v", "1",
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
         "-",
     ]
     try:
@@ -83,23 +76,11 @@ def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmp
 
 
 def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
-    try:
-        if not data:
-            return False
-        if len(data) < min_size:
+    if not data or len(data) < min_size:
+        if data:
             LOG.warning("Image too small (%d bytes)", len(data))
-            return False
-        # attempt to verify with PIL if available
-        if Image is not None:
-            try:
-                im = Image.open(BytesIO(data))
-                im.verify()
-            except Exception:
-                LOG.warning("Image bytes could not be verified by PIL")
-                return False
-        return True
-    except Exception:
         return False
+    return True
 
 
 class _FTP_TLS_CustomHostname(FTP_TLS):
@@ -135,6 +116,7 @@ class FTPSUploader:
         self.cafile = cafile
         self.timeout = timeout
         self.tls_hostname = tls_hostname
+        self._ftp = None
 
     def _connect(self):
         ctx = None
@@ -185,154 +167,41 @@ class FTPSUploader:
                     except Exception:
                         pass
 
-    def upload_atomic(self, local_path, remote_path):
-        ftp = self._connect()
-        try:
-            rdir = os.path.dirname(remote_path)
-            fname = os.path.basename(remote_path)
-            self._ensure_remote_dir(ftp, rdir)
-            temp_name = fname + ".tmp"
-            with open(local_path, "rb") as f:
-                ftp.storbinary(f"STOR {temp_name}", f)
+    def connect(self):
+        """Establish (or re-establish) the FTP connection."""
+        self.close()
+        self._ftp = self._connect()
+
+    def close(self):
+        if self._ftp is not None:
             try:
-                ftp.rename(temp_name, fname)
-            except Exception:
-                try:
-                    ftp.delete(fname)
-                except Exception:
-                    pass
-                ftp.rename(temp_name, fname)
-        finally:
-            try:
-                ftp.quit()
+                self._ftp.quit()
             except Exception:
                 pass
+            self._ftp = None
+
+    def _get_ftp(self):
+        """Return the current connection, or create one lazily."""
+        if self._ftp is None:
+            self._ftp = self._connect()
+        return self._ftp
 
     def upload_bytes(self, data_bytes, remote_path):
-        ftp = self._connect()
+        ftp = self._get_ftp()
+        rdir = os.path.dirname(remote_path)
+        fname = os.path.basename(remote_path)
+        self._ensure_remote_dir(ftp, rdir)
+        temp_name = fname + ".tmp"
+        bio = BytesIO(data_bytes)
+        ftp.storbinary(f"STOR {temp_name}", bio)
         try:
-            rdir = os.path.dirname(remote_path)
-            fname = os.path.basename(remote_path)
-            self._ensure_remote_dir(ftp, rdir)
-            temp_name = fname + ".tmp"
-            bio = BytesIO(data_bytes)
-            ftp.storbinary(f"STOR {temp_name}", bio)
+            ftp.rename(temp_name, fname)
+        except Exception:
             try:
-                ftp.rename(temp_name, fname)
-            except Exception:
-                try:
-                    ftp.delete(fname)
-                except Exception:
-                    pass
-                ftp.rename(temp_name, fname)
-        finally:
-            try:
-                ftp.quit()
+                ftp.delete(fname)
             except Exception:
                 pass
-
-class SFTPUploader:
-    def __init__(self, host, port, user, pkey_path=None, password=None, timeout=15):
-        if paramiko is None:
-            raise RuntimeError("paramiko is required for SFTP uploads")
-        self.host = host
-        self.port = port
-        self.user = user
-        self.pkey_path = pkey_path
-        self.password = password
-        self.timeout = timeout
-
-    def _connect(self):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        kwargs = {
-            "hostname": self.host,
-            "port": self.port,
-            "username": self.user,
-            "timeout": self.timeout,
-        }
-        if self.pkey_path:
-            pkey = paramiko.RSAKey.from_private_key_file(self.pkey_path)
-            kwargs["pkey"] = pkey
-        else:
-            kwargs["password"] = self.password
-        client.connect(**kwargs)
-        return client
-
-    def upload_atomic(self, local_path, remote_path):
-        client = self._connect()
-        try:
-            sftp = client.open_sftp()
-            rdir = os.path.dirname(remote_path)
-            # ensure remote dir exists (best-effort)
-            try:
-                sftp.stat(rdir)
-            except IOError:
-                parts = rdir.split("/")
-                cur = ""
-                for p in parts:
-                    if not p:
-                        continue
-                    cur += "/" + p
-                    try:
-                        sftp.stat(cur)
-                    except IOError:
-                        try:
-                            sftp.mkdir(cur)
-                        except Exception:
-                            pass
-            remote_tmp = remote_path + ".tmp"
-            sftp.put(local_path, remote_tmp)
-            try:
-                sftp.rename(remote_tmp, remote_path)
-            except IOError:
-                try:
-                    sftp.remove(remote_path)
-                except Exception:
-                    pass
-                sftp.rename(remote_tmp, remote_path)
-            sftp.close()
-        finally:
-            client.close()
-
-    def upload_bytes(self, data_bytes, remote_path):
-        """Upload bytes to remote path atomically (write to temp then rename)."""
-        client = self._connect()
-        try:
-            sftp = client.open_sftp()
-            rdir = os.path.dirname(remote_path)
-            try:
-                sftp.stat(rdir)
-            except IOError:
-                parts = rdir.split("/")
-                cur = ""
-                for p in parts:
-                    if not p:
-                        continue
-                    cur += "/" + p
-                    try:
-                        sftp.stat(cur)
-                    except IOError:
-                        try:
-                            sftp.mkdir(cur)
-                        except Exception:
-                            pass
-            remote_tmp = remote_path + ".tmp"
-            # write bytes to remote temp file
-            with sftp.open(remote_tmp, "wb") as f:
-                f.write(data_bytes)
-            try:
-                sftp.rename(remote_tmp, remote_path)
-            except IOError:
-                try:
-                    sftp.remove(remote_path)
-                except Exception:
-                    pass
-                sftp.rename(remote_tmp, remote_path)
-            sftp.close()
-        finally:
-            client.close()
-
+            ftp.rename(temp_name, fname)
 
 def process_camera(camera, uploader, config):
     cam_id = camera.get("id")
@@ -351,28 +220,30 @@ def process_camera(camera, uploader, config):
         LOG.error("Failed to capture valid image for %s", cam_id)
         return False
 
-    # convert to WebP in-memory
+    # convert to WebP in-memory (single PIL open for validation + conversion)
     upload_bytes = image_bytes
     upload_remote = remote_path
     if Image is None:
         LOG.warning("Pillow not available; uploading original image bytes")
     else:
         try:
+            im = Image.open(BytesIO(image_bytes))
+            im.load()  # fully decode once — validates and prepares for conversion
             buf = BytesIO()
-            with Image.open(BytesIO(image_bytes)) as im:
-                im.save(buf, format="WEBP", quality=85)
+            im.save(buf, format="WEBP", quality=85)
+            im.close()
             webp_bytes = buf.getvalue()
-            if validate_image_bytes(webp_bytes, min_size=100):
+            if len(webp_bytes) >= 100:
                 upload_bytes = webp_bytes
                 base, _ = os.path.splitext(remote_path)
                 upload_remote = base + ".webp"
                 LOG.debug("Converted to WebP (in-memory), uploading %s", upload_remote)
             else:
-                LOG.warning("Converted WebP invalid; uploading original JPEG bytes")
+                LOG.warning("Converted WebP too small; uploading original JPEG bytes")
         except Exception:
             LOG.exception("Failed to convert image to WebP for %s", cam_id)
 
-    # upload bytes via SFTP (atomic write)
+    # upload bytes (atomic write via temp + rename)
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
@@ -382,6 +253,7 @@ def process_camera(camera, uploader, config):
             break
         except Exception:
             LOG.exception("Upload attempt %d failed for %s", attempt, cam_id)
+            uploader.close()  # force reconnect on next attempt
             if attempt < attempts:
                 time.sleep(2 ** attempt)
             else:
@@ -418,31 +290,17 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         cameras = json.load(f)
 
-    # Prefer FTPS (FTPES) if configured, otherwise fall back to SFTP
-    ftps_host = os.environ.get("FTPS_HOST") or os.environ.get("FTP_HOST")
-    ftps_port = int(os.environ.get("FTPS_PORT", "21")) if os.environ.get("FTPS_PORT") else 21
+    ftps_host = os.environ.get("FTPS_HOST")
+    if not ftps_host:
+        LOG.error("No upload destination configured. Set FTPS_HOST environment variable.")
+        sys.exit(3)
+    ftps_port = int(os.environ.get("FTPS_PORT", "21"))
     ftps_user = os.environ.get("FTPS_USER")
     ftps_password = os.environ.get("FTPS_PASSWORD")
     ftps_cafile = os.environ.get("FTPS_CAFILE")
     ftps_tls_hostname = os.environ.get("FTPS_TLS_HOSTNAME")
 
-    sftp_host = os.environ.get("SFTP_HOST")
-    sftp_port = int(os.environ.get("SFTP_PORT", "22"))
-    sftp_user = os.environ.get("SFTP_USER")
-    sftp_key = os.environ.get("SFTP_PRIVATE_KEY")
-    sftp_password = os.environ.get("SFTP_PASSWORD")
-
-    uploader = None
-    if ftps_host:
-        uploader = FTPSUploader(ftps_host, ftps_port, ftps_user, password=ftps_password, cafile=ftps_cafile, tls_hostname=ftps_tls_hostname)
-    elif sftp_host:
-        if paramiko is None:
-            LOG.error("paramiko is not installed. Install requirements or configure FTPS and try again.")
-            sys.exit(3)
-        uploader = SFTPUploader(sftp_host, sftp_port, sftp_user, pkey_path=sftp_key, password=sftp_password)
-    else:
-        LOG.error("No upload destination configured. Set FTPS_HOST or SFTP_HOST environment variable.")
-        sys.exit(3)
+    uploader = FTPSUploader(ftps_host, ftps_port, ftps_user, password=ftps_password, cafile=ftps_cafile, tls_hostname=ftps_tls_hostname)
 
     # runtime configuration
     interval = os.environ.get("INTERVAL_SECONDS")
@@ -451,12 +309,8 @@ def main():
     except Exception:
         interval = None
 
-    # WebP conversion is mandatory; script always converts captured images to WebP
-    convert_webp = True
-
     config = {
         "output_dir": os.environ.get("OUTPUT_DIR"),
-        "convert_webp": True,
     }
 
     def run_once():
