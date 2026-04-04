@@ -7,6 +7,7 @@ Reads camera list from a JSON file and uploads each camera's snapshot
 to the configured remote path over FTPS (explicit TLS). Uses ffmpeg for RTSP captures.
 """
 import argparse
+import base64
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from datetime import datetime
 from io import BytesIO
 import ssl
@@ -73,6 +75,27 @@ def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmp
         LOG.exception("ffmpeg capture failed: %s", e)
     return None
 
+
+def fetch_http_snapshot(url, username=None, password=None, timeout=10):
+    """Fetch a snapshot image from an HTTP/HTTPS URL and return the bytes.
+
+    Supports HTTP Basic Auth via `username`/`password`. The URL can also embed
+    credentials (http://user:pass@host/...) as an alternative.
+    """
+    req = urllib.request.Request(url)
+    if username or password:
+        creds = base64.b64encode(
+            f"{username or ''}:{password or ''}".encode()
+        ).decode()
+        req.add_header("Authorization", f"Basic {creds}")
+    try:
+        LOG.debug("Fetching HTTP snapshot: %s", url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        return data if data else None
+    except Exception as e:
+        LOG.exception("HTTP snapshot fetch failed for %s: %s", url, e)
+        return None
 
 
 def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
@@ -210,9 +233,16 @@ def process_camera(camera, uploader, config):
     user = camera.get("user")
     password = camera.get("pass")
     remote_path = camera.get("remote_path")
-    # capture image into memory (bytes)
+    # capture image: prefer HTTP snapshot URL, fall back to RTSP via ffmpeg
     image_bytes = None
-    if rtsp:
+    snapshot_url = camera.get("snapshot_url")
+    if snapshot_url:
+        LOG.debug("Fetching HTTP snapshot for %s", cam_id)
+        image_bytes = fetch_http_snapshot(snapshot_url, user, password)
+        if not validate_image_bytes(image_bytes):
+            LOG.warning("HTTP snapshot failed for %s, falling back to RTSP", cam_id)
+            image_bytes = None
+    if image_bytes is None and rtsp:
         LOG.debug("Attempting RTSP capture for %s", cam_id)
         image_bytes = run_ffmpeg_snapshot(rtsp, user, password)
 

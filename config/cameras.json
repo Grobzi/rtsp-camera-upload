@@ -1,7 +1,8 @@
 [
   {
     "id": "cam1",
+    "__snapshot_url": "http://192.168.3.57/api/1.0/snapshot",
     "rtsp_url": "rtsp://192.168.3.57:554/s0",
-    "remote_path": "/webcams/img1.jpg"
+    "remote_path": "/webcams/img1.webp"
   }
 ]
