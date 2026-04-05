@@ -25,6 +25,13 @@ Continuous mode
 - To run continuously and capture+upload every N seconds, set `INTERVAL_SECONDS` in `config/.env` (for example `INTERVAL_SECONDS=60`). The script will loop and process all cameras every interval.
 - Captured images are converted to WebP before upload (always enabled). The script will upload `.webp` for each camera — ensure your static site polls the `.webp` filename.
 
+WebP pipeline options
+- `WEBP_PIPELINE=ffmpeg` (default): ffmpeg captures RTSP and directly emits WebP.
+- `WEBP_PIPELINE=cwebp`: ffmpeg captures RTSP as JPEG, then `cwebp` converts JPEG to WebP.
+- Optional executable overrides:
+	- `FFMPEG_CMD=/absolute/path/to/ffmpeg`
+	- `CWEBP_CMD=/absolute/path/to/cwebp`
+
 Scheduling with cron (every 5 minutes)
 
 ```cron

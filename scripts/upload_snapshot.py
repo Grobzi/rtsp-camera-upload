@@ -12,98 +12,214 @@ import json
 import logging
 import os
 import shlex
+import shutil
+import ssl
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from datetime import datetime
-from io import BytesIO
-import ssl
 from ftplib import FTP_TLS
-import shutil
+from io import BytesIO
 
 try:
     from dotenv import load_dotenv
 except Exception:
     load_dotenv = None
 
-try:
-    from PIL import Image
-except Exception:
-    Image = None
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 DEFAULT_MIN_SIZE = 1024
 
+WEBP_PIPELINE_FFMPEG = "ffmpeg"
+WEBP_PIPELINE_CWEBP = "cwebp"
+
 LOG = logging.getLogger("uploader")
 
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
 
-def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmpeg_cmd=None):
-    """Capture a single frame from RTSP using ffmpeg and return JPEG bytes (in-memory).
 
-    The ffmpeg executable will be taken from `ffmpeg_cmd` param, `FFMPEG_CMD`
-    environment variable, or located via PATH (`shutil.which`). If not found,
-    a clear error is logged and None is returned.
-    """
-    cmd_exe = ffmpeg_cmd or os.environ.get("FFMPEG_CMD") or shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
-    if not cmd_exe:
-        LOG.error("ffmpeg not found. Install ffmpeg and add it to PATH, or set FFMPEG_CMD to the ffmpeg executable path.")
-        return None
+def _find_executable(name, env_var=None, explicit=None):
+    """Locate an executable by explicit path, environment variable, or PATH."""
+    return (
+        explicit
+        or (os.environ.get(env_var) if env_var else None)
+        or shutil.which(name)
+        or shutil.which(f"{name}.exe")
+    )
 
-    # allow overriding timeout via environment variable (seconds)
+
+def _get_ffmpeg_timeout(default=30):
+    """Return ffmpeg timeout from FFMPEG_TIMEOUT env var or *default*."""
     try:
-        env_timeout = os.environ.get("FFMPEG_TIMEOUT")
-        if env_timeout:
-            timeout = int(env_timeout)
-    except Exception:
+        val = os.environ.get("FFMPEG_TIMEOUT")
+        if val:
+            return int(val)
+    except (ValueError, TypeError):
         pass
+    return default
 
-    cmd = [
-        cmd_exe,
-        "-y",
-        "-nostdin",
+
+def _run_cmd(cmd, label, input_bytes=None, timeout=30):
+    """Run a subprocess and return stdout bytes on success, or None.
+
+    Handles logging, stderr capture, timeout, and common exceptions.
+    When *input_bytes* is provided it is fed to stdin via a pipe;
+    otherwise stdin is connected to devnull.
+    """
+    try:
+        LOG.debug("Running %s: %s", label, " ".join(shlex.quote(c) for c in cmd))
+        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        if input_bytes is not None:
+            kwargs["input"] = input_bytes
+        else:
+            kwargs["stdin"] = subprocess.DEVNULL
+        p = subprocess.run(cmd, **kwargs)
+        stderr_text = p.stderr.decode("utf-8", errors="replace").strip() if p.stderr else ""
+        if p.returncode == 0 and p.stdout:
+            if stderr_text:
+                LOG.debug("%s stderr: %s", label, stderr_text)
+            return p.stdout
+        if stderr_text:
+            LOG.debug("%s failed (rc=%s): %s", label, p.returncode, stderr_text)
+    except subprocess.TimeoutExpired:
+        LOG.warning("%s timed out (timeout=%s)", label, timeout)
+    except FileNotFoundError:
+        LOG.error("%s executable not found: %s", label, cmd[0])
+    except Exception as exc:
+        LOG.exception("%s failed: %s", label, exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Image capture / conversion
+# ---------------------------------------------------------------------------
+
+
+def _ffmpeg_rtsp_cmd(ffmpeg, rtsp_url, output_args):
+    """Build the common ffmpeg RTSP single-frame capture command."""
+    return [
+        ffmpeg, "-y", "-nostdin",
         "-rtsp_transport", "tcp",
         "-probesize", "524288",
         "-analyzeduration", "1000000",
         "-i", rtsp_url,
         "-frames:v", "1",
-        "-f", "image2pipe",
-        "-vcodec", "mjpeg",
-        "-",
+        *output_args,
+        "pipe:1",
     ]
-    try:
-        LOG.debug("Running ffmpeg: %s", ' '.join(shlex.quote(c) for c in cmd))
-        # capture stderr so we can show ffmpeg diagnostics when LOG_LEVEL=DEBUG
-        # ensure ffmpeg cannot read from the user's terminal
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=timeout)
-        stderr_text = p.stderr.decode('utf-8', errors='replace') if p.stderr else ''
-        if p.returncode == 0 and p.stdout and len(p.stdout) > 0:
-            if stderr_text:
-                LOG.debug("ffmpeg stderr: %s", stderr_text.strip())
-            return p.stdout
-        else:
-            if stderr_text:
-                LOG.debug("ffmpeg failed (rc=%s): %s", p.returncode, stderr_text.strip())
-    except subprocess.TimeoutExpired:
-        LOG.warning("ffmpeg timed out for %s (timeout=%s)", rtsp_url, timeout)
-    except FileNotFoundError:
-        LOG.error("ffmpeg executable not found at %s", cmd_exe)
-    except Exception as e:
-        LOG.exception("ffmpeg capture failed: %s", e)
-    return None
 
 
-def fetch_http_snapshot(url, username=None, password=None, timeout=10):
-    """Fetch a snapshot image from an HTTP/HTTPS URL and return the bytes.
+def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=30, ffmpeg_cmd=None):
+    """Capture a single RTSP frame as WebP bytes via ffmpeg."""
+    ffmpeg = _find_executable("ffmpeg", "FFMPEG_CMD", ffmpeg_cmd)
+    if not ffmpeg:
+        LOG.error("ffmpeg not found. Install it or set FFMPEG_CMD.")
+        return None
+    quality = os.environ.get("FFMPEG_WEBP_QUALITY", "85")
+    cmd = _ffmpeg_rtsp_cmd(ffmpeg, rtsp_url, [
+        "-vcodec", "libwebp", "-lossless", "0",
+        "-q:v", quality, "-preset", "picture", "-f", "webp",
+    ])
+    return _run_cmd(cmd, "ffmpeg-webp", timeout=_get_ffmpeg_timeout(timeout))
 
-    Supports HTTP Basic Auth via `username`/`password`. The URL can also embed
-    credentials (http://user:pass@host/...) as an alternative.
-    """
+
+def run_ffmpeg_snapshot_jpeg(rtsp_url, timeout=30, ffmpeg_cmd=None):
+    """Capture a single RTSP frame as JPEG bytes via ffmpeg."""
+    ffmpeg = _find_executable("ffmpeg", "FFMPEG_CMD", ffmpeg_cmd)
+    if not ffmpeg:
+        LOG.error("ffmpeg not found. Install it or set FFMPEG_CMD.")
+        return None
+    quality = str(os.environ.get("FFMPEG_JPEG_QUALITY", "2"))
+    cmd = _ffmpeg_rtsp_cmd(ffmpeg, rtsp_url, [
+        "-q:v", quality, "-f", "image2pipe", "-vcodec", "mjpeg",
+    ])
+    return _run_cmd(cmd, "ffmpeg-jpeg", timeout=_get_ffmpeg_timeout(timeout))
+
+
+def ffmpeg_image_to_webp_bytes(img_bytes, quality=85, timeout=30, ffmpeg_cmd=None):
+    """Convert image bytes to WebP using ffmpeg (pipe-to-pipe)."""
+    ffmpeg = _find_executable("ffmpeg", "FFMPEG_CMD", ffmpeg_cmd)
+    if not ffmpeg:
+        LOG.error("ffmpeg not found for WebP conversion")
+        return None
+    q = str(os.environ.get("FFMPEG_WEBP_QUALITY", str(quality)))
+    cmd = [
+        ffmpeg, "-y", "-nostdin",
+        "-f", "image2pipe", "-i", "pipe:0",
+        "-vcodec", "libwebp", "-lossless", "0", "-q:v", q,
+        "-preset", "picture", "-f", "webp", "pipe:1",
+    ]
+    return _run_cmd(cmd, "ffmpeg-to-webp", input_bytes=img_bytes, timeout=timeout)
+
+
+def cwebp_image_to_webp_bytes(img_bytes, quality=85, timeout=30, cwebp_cmd=None):
+    """Convert image bytes to WebP using cwebp (pipe-to-pipe)."""
+    cwebp = _find_executable("cwebp", "CWEBP_CMD", cwebp_cmd)
+    if not cwebp:
+        LOG.error("cwebp not found. Install it or set CWEBP_CMD.")
+        return None
+    q = str(os.environ.get("CWEBP_QUALITY", str(quality)))
+    cmd = [cwebp, "-quiet", "-q", q, "-o", "-", "--", "-"]
+    return _run_cmd(cmd, "cwebp", input_bytes=img_bytes, timeout=timeout)
+
+
+def convert_to_webp_bytes(img_bytes, pipeline=WEBP_PIPELINE_FFMPEG):
+    """Convert non-WebP image bytes to WebP using the selected pipeline."""
+    if pipeline == WEBP_PIPELINE_CWEBP:
+        return cwebp_image_to_webp_bytes(img_bytes)
+    return ffmpeg_image_to_webp_bytes(img_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Image utilities
+# ---------------------------------------------------------------------------
+
+
+def is_webp_bytes(data):
+    """Best-effort detection of a WebP payload from RIFF/WEBP signature."""
+    return bool(data and len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
+def ensure_webp_remote_path(remote_path):
+    """Normalize remote filename extension to .webp."""
+    if not remote_path:
+        return remote_path
+    base, _ = os.path.splitext(remote_path)
+    return base + ".webp"
+
+
+def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
+    if not data or len(data) < min_size:
+        if data:
+            LOG.warning("Image too small (%d bytes)", len(data))
+        return False
+    return True
+
+
+def resolve_webp_pipeline(raw_value=None):
+    """Return normalized WebP conversion pipeline (ffmpeg|cwebp)."""
+    value = (raw_value or os.environ.get("WEBP_PIPELINE", WEBP_PIPELINE_FFMPEG)).strip().lower()
+    if value in (WEBP_PIPELINE_FFMPEG, WEBP_PIPELINE_CWEBP):
+        return value
+    LOG.warning("Unknown WEBP_PIPELINE=%s, falling back to %s", value, WEBP_PIPELINE_FFMPEG)
+    return WEBP_PIPELINE_FFMPEG
+
+
+# ---------------------------------------------------------------------------
+# HTTP snapshot
+# ---------------------------------------------------------------------------
+
+
+def fetch_http_snapshot(url, username=None, password=None, timeout=30):
+    """Fetch a snapshot image from an HTTP/HTTPS URL."""
     req = urllib.request.Request(url)
     if username or password:
-        creds = base64.b64encode(
-            f"{username or ''}:{password or ''}".encode()
-        ).decode()
+        creds = base64.b64encode(f"{username or ''}:{password or ''}".encode()).decode()
         req.add_header("Authorization", f"Basic {creds}")
     try:
         LOG.debug("Fetching HTTP snapshot: %s", url)
@@ -115,12 +231,9 @@ def fetch_http_snapshot(url, username=None, password=None, timeout=10):
         return None
 
 
-def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
-    if not data or len(data) < min_size:
-        if data:
-            LOG.warning("Image too small (%d bytes)", len(data))
-        return False
-    return True
+# ---------------------------------------------------------------------------
+# FTPS upload
+# ---------------------------------------------------------------------------
 
 
 class _FTP_TLS_CustomHostname(FTP_TLS):
@@ -128,7 +241,6 @@ class _FTP_TLS_CustomHostname(FTP_TLS):
     tls_hostname = None
 
     def _with_tls_hostname(self, fn):
-        """Call fn() with self.host temporarily set to tls_hostname for SNI/verification."""
         if self.tls_hostname:
             real_host = self.host
             self.host = self.tls_hostname
@@ -139,16 +251,16 @@ class _FTP_TLS_CustomHostname(FTP_TLS):
         return fn()
 
     def auth(self):
-        """Upgrade control connection to TLS using the certificate hostname for SNI."""
         return self._with_tls_hostname(super().auth)
 
     def ntransfercmd(self, cmd, rest=None):
-        """Open data connection using the certificate hostname for SNI."""
-        return self._with_tls_hostname(lambda: super(_FTP_TLS_CustomHostname, self).ntransfercmd(cmd, rest))
+        return self._with_tls_hostname(
+            lambda: super(_FTP_TLS_CustomHostname, self).ntransfercmd(cmd, rest)
+        )
 
 
 class FTPSUploader:
-    def __init__(self, host, port, user, password=None, cafile=None, timeout=15, tls_hostname=None):
+    def __init__(self, host, port, user, password=None, cafile=None, timeout=60, tls_hostname=None):
         self.host = host
         self.port = port
         self.user = user
@@ -166,20 +278,18 @@ class FTPSUploader:
                 try:
                     ctx.load_verify_locations(self.cafile)
                 except Exception:
-                    # fallback to default context if cafile invalid
                     pass
         except Exception:
             ctx = None
 
         if self.tls_hostname:
-            ftp = _FTP_TLS_CustomHostname(context=ctx) if ctx is not None else _FTP_TLS_CustomHostname()
+            ftp = _FTP_TLS_CustomHostname(context=ctx) if ctx else _FTP_TLS_CustomHostname()
             ftp.tls_hostname = self.tls_hostname
         else:
-            ftp = FTP_TLS(context=ctx) if ctx is not None else FTP_TLS()
+            ftp = FTP_TLS(context=ctx) if ctx else FTP_TLS()
         ftp.connect(self.host, self.port, timeout=self.timeout)
         ftp.login(self.user, self.password)
         try:
-            # secure the data connection
             ftp.prot_p()
         except Exception:
             pass
@@ -193,8 +303,7 @@ class FTPSUploader:
             ftp.cwd("/")
         except Exception:
             pass
-        parts = [p for p in rdir.split("/") if p]
-        for part in parts:
+        for part in (p for p in rdir.split("/") if p):
             try:
                 ftp.cwd(part)
             except Exception:
@@ -232,8 +341,7 @@ class FTPSUploader:
         fname = os.path.basename(remote_path)
         self._ensure_remote_dir(ftp, rdir)
         temp_name = fname + ".tmp"
-        bio = BytesIO(data_bytes)
-        ftp.storbinary(f"STOR {temp_name}", bio)
+        ftp.storbinary(f"STOR {temp_name}", BytesIO(data_bytes))
         try:
             ftp.rename(temp_name, fname)
         except Exception:
@@ -243,90 +351,119 @@ class FTPSUploader:
                 pass
             ftp.rename(temp_name, fname)
 
-def process_camera(camera, uploader, config):
+
+# ---------------------------------------------------------------------------
+# Camera processing
+# ---------------------------------------------------------------------------
+
+
+def _capture_image(camera, webp_pipeline):
+    """Return (image_bytes, remote_path) for a camera, or (None, ...) on failure."""
     cam_id = camera.get("id")
-    LOG.info("Processing camera %s", cam_id)
-    rtsp = camera.get("rtsp_url")
     user = camera.get("user")
     password = camera.get("pass")
     remote_path = camera.get("remote_path")
-    # capture image: prefer HTTP snapshot URL, fall back to RTSP via ffmpeg
     image_bytes = None
+
+    # 1. Try HTTP snapshot first
     snapshot_url = camera.get("snapshot_url")
     if snapshot_url:
         LOG.debug("Fetching HTTP snapshot for %s", cam_id)
         image_bytes = fetch_http_snapshot(snapshot_url, user, password)
-        if not validate_image_bytes(image_bytes):
+        if validate_image_bytes(image_bytes):
+            if not is_webp_bytes(image_bytes):
+                LOG.debug("Converting HTTP snapshot to WebP for %s using %s", cam_id, webp_pipeline)
+                webp_bytes = convert_to_webp_bytes(image_bytes, pipeline=webp_pipeline)
+                if webp_bytes and validate_image_bytes(webp_bytes):
+                    image_bytes = webp_bytes
+                    remote_path = ensure_webp_remote_path(remote_path)
+                else:
+                    LOG.warning("WebP conversion failed for %s; uploading original bytes", cam_id)
+            else:
+                remote_path = ensure_webp_remote_path(remote_path)
+        else:
             LOG.warning("HTTP snapshot failed for %s, falling back to RTSP", cam_id)
             image_bytes = None
+
+    # 2. Fall back to RTSP via ffmpeg
+    rtsp = camera.get("rtsp_url")
     if image_bytes is None and rtsp:
         LOG.debug("Attempting RTSP capture for %s", cam_id)
-        image_bytes = run_ffmpeg_snapshot(rtsp, user, password)
+        if webp_pipeline == WEBP_PIPELINE_CWEBP:
+            jpeg_bytes = run_ffmpeg_snapshot_jpeg(rtsp)
+            if validate_image_bytes(jpeg_bytes):
+                image_bytes = cwebp_image_to_webp_bytes(jpeg_bytes)
+        else:
+            image_bytes = run_ffmpeg_snapshot(rtsp, user, password)
+        if image_bytes:
+            remote_path = ensure_webp_remote_path(remote_path)
+
+    return image_bytes, remote_path
+
+
+def _upload_with_retries(uploader, data, remote_path, cam_id, attempts=3):
+    """Upload bytes with retry logic; returns True on success."""
+    for attempt in range(1, attempts + 1):
+        try:
+            LOG.debug("Uploading to %s (attempt %d)", remote_path, attempt)
+            uploader.upload_bytes(data, remote_path)
+            LOG.info("Uploaded camera %s to %s", cam_id, remote_path)
+            return True
+        except Exception:
+            LOG.exception("Upload attempt %d failed for %s", attempt, cam_id)
+            uploader.close()
+            if attempt < attempts:
+                time.sleep(2 ** attempt)
+    LOG.error("All upload attempts failed for %s", cam_id)
+    return False
+
+
+def _save_local_copy(image_bytes, remote_path, cam_id, output_dir):
+    """Save a timestamped local copy if *output_dir* is set."""
+    if not output_dir:
+        return
+    try:
+        dest_dir = os.path.join(output_dir, cam_id)
+        os.makedirs(dest_dir, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        _, ext = os.path.splitext(remote_path)
+        dest = os.path.join(dest_dir, f"{ts}{ext or '.webp'}")
+        with open(dest, "wb") as f:
+            f.write(image_bytes)
+    except Exception:
+        LOG.exception("Failed to write local copy for %s", cam_id)
+
+
+def process_camera(camera, uploader, config, webp_pipeline=WEBP_PIPELINE_FFMPEG):
+    cam_id = camera.get("id")
+    LOG.info("Processing camera %s", cam_id)
+
+    if not camera.get("remote_path"):
+        LOG.error("No remote_path configured for %s", cam_id)
+        return False
+
+    image_bytes, remote_path = _capture_image(camera, webp_pipeline)
 
     if not validate_image_bytes(image_bytes):
         LOG.error("Failed to capture valid image for %s", cam_id)
         return False
 
-    # convert to WebP in-memory (single PIL open for validation + conversion)
-    upload_bytes = image_bytes
-    upload_remote = remote_path
-    if Image is None:
-        LOG.warning("Pillow not available; uploading original image bytes")
-    else:
-        try:
-            im = Image.open(BytesIO(image_bytes))
-            im.load()  # fully decode once — validates and prepares for conversion
-            buf = BytesIO()
-            im.save(buf, format="WEBP", quality=85)
-            im.close()
-            webp_bytes = buf.getvalue()
-            if len(webp_bytes) >= 100:
-                upload_bytes = webp_bytes
-                base, _ = os.path.splitext(remote_path)
-                upload_remote = base + ".webp"
-                LOG.debug("Converted to WebP (in-memory), uploading %s", upload_remote)
-            else:
-                LOG.warning("Converted WebP too small; uploading original JPEG bytes")
-        except Exception:
-            LOG.exception("Failed to convert image to WebP for %s", cam_id)
+    if not _upload_with_retries(uploader, image_bytes, remote_path, cam_id):
+        return False
 
-    # upload bytes (atomic write via temp + rename)
-    attempts = 3
-    for attempt in range(1, attempts + 1):
-        try:
-            LOG.debug("Uploading bytes to %s (attempt %d)", upload_remote, attempt)
-            uploader.upload_bytes(upload_bytes, upload_remote)
-            LOG.info("Uploaded camera %s to %s", cam_id, upload_remote)
-            break
-        except Exception:
-            LOG.exception("Upload attempt %d failed for %s", attempt, cam_id)
-            uploader.close()  # force reconnect on next attempt
-            if attempt < attempts:
-                time.sleep(2 ** attempt)
-            else:
-                LOG.error("All upload attempts failed for %s", cam_id)
-                return False
-
-    # optionally save a local timestamped JPEG copy if configured
-    out_dir = config.get("output_dir")
-    if out_dir:
-        try:
-            dest_dir = os.path.join(out_dir, cam_id)
-            os.makedirs(dest_dir, exist_ok=True)
-            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            dest = os.path.join(dest_dir, f"{ts}.jpg")
-            with open(dest, "wb") as f:
-                f.write(image_bytes)
-        except Exception:
-            LOG.exception("Failed to write local copy for %s", cam_id)
-
+    _save_local_copy(image_bytes, remote_path, cam_id, config.get("output_dir"))
     return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/cameras.json")
-    parser.add_argument("--env", default=".env")
+    parser.add_argument("--env", default="config/.env")
     args = parser.parse_args()
 
     if load_dotenv and os.path.exists(args.env):
@@ -343,29 +480,31 @@ def main():
         sys.exit(3)
     ftps_port = int(os.environ.get("FTPS_PORT", "21"))
     ftps_user = os.environ.get("FTPS_USER")
-    ftps_password = os.environ.get("FTPS_PASSWORD")
-    ftps_cafile = os.environ.get("FTPS_CAFILE")
-    ftps_tls_hostname = os.environ.get("FTPS_TLS_HOSTNAME")
+    if not ftps_user:
+        LOG.error("No FTPS username configured. Set FTPS_USER environment variable.")
+        sys.exit(3)
 
-    uploader = FTPSUploader(ftps_host, ftps_port, ftps_user, password=ftps_password, cafile=ftps_cafile, tls_hostname=ftps_tls_hostname)
+    uploader = FTPSUploader(
+        ftps_host, ftps_port, ftps_user,
+        password=os.environ.get("FTPS_PASSWORD"),
+        cafile=os.environ.get("FTPS_CAFILE"),
+        tls_hostname=os.environ.get("FTPS_TLS_HOSTNAME"),
+    )
 
-    # runtime configuration
     interval = os.environ.get("INTERVAL_SECONDS")
     try:
         interval = int(interval) if interval else None
     except Exception:
         interval = None
 
-    config = {
-        "output_dir": os.environ.get("OUTPUT_DIR"),
-    }
+    webp_pipeline = resolve_webp_pipeline()
+    LOG.info("Using WebP pipeline: %s", webp_pipeline)
+
+    config = {"output_dir": os.environ.get("OUTPUT_DIR")}
 
     def run_once():
-        ok_all = True
-        for cam in cameras:
-            ok = process_camera(cam, uploader, config)
-            ok_all = ok_all and ok
-        return ok_all
+        results = [process_camera(cam, uploader, config, webp_pipeline=webp_pipeline) for cam in cameras]
+        return all(results)
 
     if interval and interval > 0:
         LOG.info("Starting continuous mode: interval=%s seconds", interval)
@@ -373,16 +512,14 @@ def main():
             while True:
                 start = time.time()
                 run_once()
-                elapsed = time.time() - start
-                to_sleep = interval - elapsed
-                if to_sleep > 0:
-                    time.sleep(to_sleep)
+                remaining = interval - (time.time() - start)
+                if remaining > 0:
+                    time.sleep(remaining)
         except KeyboardInterrupt:
             LOG.info("Interrupted, exiting")
             sys.exit(0)
     else:
-        overall_ok = run_once()
-        sys.exit(0 if overall_ok else 2)
+        sys.exit(0 if run_once() else 2)
 
 
 if __name__ == "__main__":
