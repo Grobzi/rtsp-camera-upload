@@ -50,9 +50,18 @@ def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmp
         LOG.error("ffmpeg not found. Install ffmpeg and add it to PATH, or set FFMPEG_CMD to the ffmpeg executable path.")
         return None
 
+    # allow overriding timeout via environment variable (seconds)
+    try:
+        env_timeout = os.environ.get("FFMPEG_TIMEOUT")
+        if env_timeout:
+            timeout = int(env_timeout)
+    except Exception:
+        pass
+
     cmd = [
         cmd_exe,
         "-y",
+        "-nostdin",
         "-rtsp_transport", "tcp",
         "-probesize", "524288",
         "-analyzeduration", "1000000",
@@ -64,11 +73,19 @@ def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=15, ffmp
     ]
     try:
         LOG.debug("Running ffmpeg: %s", ' '.join(shlex.quote(c) for c in cmd))
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout)
+        # capture stderr so we can show ffmpeg diagnostics when LOG_LEVEL=DEBUG
+        # ensure ffmpeg cannot read from the user's terminal
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, timeout=timeout)
+        stderr_text = p.stderr.decode('utf-8', errors='replace') if p.stderr else ''
         if p.returncode == 0 and p.stdout and len(p.stdout) > 0:
+            if stderr_text:
+                LOG.debug("ffmpeg stderr: %s", stderr_text.strip())
             return p.stdout
+        else:
+            if stderr_text:
+                LOG.debug("ffmpeg failed (rc=%s): %s", p.returncode, stderr_text.strip())
     except subprocess.TimeoutExpired:
-        LOG.warning("ffmpeg timed out for %s", rtsp_url)
+        LOG.warning("ffmpeg timed out for %s (timeout=%s)", rtsp_url, timeout)
     except FileNotFoundError:
         LOG.error("ffmpeg executable not found at %s", cmd_exe)
     except Exception as e:
