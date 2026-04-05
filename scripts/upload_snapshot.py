@@ -81,8 +81,12 @@ def _run_cmd(cmd, label, input_bytes=None, timeout=30):
             if stderr_text:
                 LOG.debug("%s stderr: %s", label, stderr_text)
             return p.stdout
-        if stderr_text:
+        if p.returncode == 0:
+            LOG.warning("%s succeeded but produced no output", label)
+        elif stderr_text:
             LOG.debug("%s failed (rc=%s): %s", label, p.returncode, stderr_text)
+        else:
+            LOG.debug("%s failed (rc=%s) with no stderr", label, p.returncode)
     except subprocess.TimeoutExpired:
         LOG.warning("%s timed out (timeout=%s)", label, timeout)
     except FileNotFoundError:
@@ -102,8 +106,8 @@ def _ffmpeg_rtsp_cmd(ffmpeg, rtsp_url, output_args):
     return [
         ffmpeg, "-y", "-nostdin",
         "-rtsp_transport", "tcp",
-        "-probesize", "524288",
-        "-analyzeduration", "1000000",
+        "-probesize", "1048576",
+        "-analyzeduration", "2000000",
         "-i", rtsp_url,
         "-frames:v", "1",
         *output_args,
@@ -211,6 +215,8 @@ def fetch_http_snapshot(url, username=None, password=None, timeout=30):
         LOG.debug("Fetching HTTP snapshot: %s", url)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = resp.read()
+        if data:
+            LOG.debug("HTTP snapshot fetched: %d bytes", len(data))
         return data if data else None
     except Exception as e:
         LOG.exception("HTTP snapshot fetch failed for %s: %s", url, e)
@@ -273,12 +279,13 @@ class FTPSUploader:
             ftp.tls_hostname = self.tls_hostname
         else:
             ftp = FTP_TLS(context=ctx) if ctx else FTP_TLS()
+        LOG.debug("Connecting to FTPS %s:%s as %s", self.host, self.port, self.user)
         ftp.connect(self.host, self.port, timeout=self.timeout)
         ftp.login(self.user, self.password)
         try:
             ftp.prot_p()
-        except Exception:
-            pass
+        except Exception as exc:
+            LOG.warning("Could not enable data channel TLS (prot_p): %s", exc)
         ftp.set_pasv(True)
         return ftp
 
@@ -294,6 +301,7 @@ class FTPSUploader:
                 ftp.cwd(part)
             except Exception:
                 try:
+                    LOG.debug("Creating remote directory: %s", part)
                     ftp.mkd(part)
                     ftp.cwd(part)
                 except Exception:
@@ -304,6 +312,7 @@ class FTPSUploader:
 
     def connect(self):
         """Establish (or re-establish) the FTP connection."""
+        LOG.debug("Establishing FTPS connection to %s:%s", self.host, self.port)
         self.close()
         self._ftp = self._connect()
 
@@ -327,6 +336,7 @@ class FTPSUploader:
         fname = os.path.basename(remote_path)
         self._ensure_remote_dir(ftp, rdir)
         temp_name = fname + ".tmp"
+        LOG.debug("Uploading %d bytes to %s", len(data_bytes), remote_path)
         ftp.storbinary(f"STOR {temp_name}", BytesIO(data_bytes))
         try:
             ftp.rename(temp_name, fname)
@@ -387,7 +397,29 @@ def _capture_image(camera):
         else:
             image_bytes = run_ffmpeg_snapshot(rtsp_with_creds)
 
+    if image_bytes is None:
+        if not snapshot_url and not rtsp:
+            LOG.error("No snapshot_url or rtsp_url configured for %s", cam_id)
+    else:
+        LOG.debug("Captured %d bytes for %s", len(image_bytes), cam_id)
+
     return image_bytes, remote_path
+
+
+def _capture_with_retries(camera, attempts=3):
+    """Capture and validate image bytes with retry logic; returns bytes or None."""
+    cam_id = camera.get("id")
+    for attempt in range(1, attempts + 1):
+        image_bytes, remote_path = _capture_image(camera)
+        if validate_image_bytes(image_bytes):
+            return image_bytes, remote_path
+        LOG.warning("Capture attempt %d/%d failed for %s", attempt, attempts, cam_id)
+        if attempt < attempts:
+            delay = 2 ** attempt
+            LOG.debug("Retrying capture in %ds", delay)
+            time.sleep(delay)
+    LOG.error("All capture attempts failed for %s", cam_id)
+    return None, camera.get("remote_path")
 
 
 def _upload_with_retries(uploader, data, remote_path, cam_id, attempts=3):
@@ -402,7 +434,9 @@ def _upload_with_retries(uploader, data, remote_path, cam_id, attempts=3):
             LOG.exception("Upload attempt %d failed for %s", attempt, cam_id)
             uploader.close()
             if attempt < attempts:
-                time.sleep(2 ** attempt)
+                delay = 2 ** attempt
+                LOG.debug("Retrying upload in %ds", delay)
+                time.sleep(delay)
     LOG.error("All upload attempts failed for %s", cam_id)
     return False
 
@@ -419,6 +453,7 @@ def _save_local_copy(image_bytes, remote_path, cam_id, output_dir):
         dest = os.path.join(dest_dir, f"{ts}{ext or '.webp'}")
         with open(dest, "wb") as f:
             f.write(image_bytes)
+        LOG.debug("Saved local copy to %s", dest)
     except Exception:
         LOG.exception("Failed to write local copy for %s", cam_id)
 
@@ -431,7 +466,7 @@ def process_camera(camera, uploader, config):
         LOG.error("No remote_path configured for %s", cam_id)
         return False
 
-    image_bytes, remote_path = _capture_image(camera)
+    image_bytes, remote_path = _capture_with_retries(camera)
 
     if not validate_image_bytes(image_bytes):
         LOG.error("Failed to capture valid image for %s", cam_id)
@@ -462,6 +497,7 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as f:
         cameras = json.load(f)
+    LOG.info("Loaded %d camera(s) from %s", len(cameras), args.config)
 
     ftps_host = os.environ.get("FTPS_HOST")
     if not ftps_host:
@@ -479,6 +515,7 @@ def main():
         cafile=os.environ.get("FTPS_CAFILE"),
         tls_hostname=os.environ.get("FTPS_TLS_HOSTNAME"),
     )
+    LOG.info("FTPS target: %s:%s (user: %s)", ftps_host, ftps_port, ftps_user)
 
     interval = os.environ.get("INTERVAL_SECONDS")
     try:
@@ -490,6 +527,11 @@ def main():
 
     def run_once():
         results = [process_camera(cam, uploader, config) for cam in cameras]
+        ok = sum(results)
+        if ok < len(results):
+            LOG.warning("%d/%d camera(s) failed", len(results) - ok, len(results))
+        else:
+            LOG.info("All %d camera(s) processed successfully", len(results))
         return all(results)
 
     if interval and interval > 0:
