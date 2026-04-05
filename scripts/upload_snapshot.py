@@ -111,7 +111,7 @@ def _ffmpeg_rtsp_cmd(ffmpeg, rtsp_url, output_args):
     ]
 
 
-def run_ffmpeg_snapshot(rtsp_url, username=None, password=None, timeout=30, ffmpeg_cmd=None):
+def run_ffmpeg_snapshot(rtsp_url, timeout=30, ffmpeg_cmd=None):
     """Capture a single RTSP frame as WebP bytes via ffmpeg."""
     ffmpeg = _find_executable("ffmpeg", "FFMPEG_CMD", ffmpeg_cmd)
     if not ffmpeg:
@@ -178,6 +178,22 @@ def output_format_for(remote_path):
     if ext in (".jpg", ".jpeg"):
         return "jpeg"
     return "webp"
+
+
+def _embed_rtsp_credentials(rtsp_url, username=None, password=None):
+    """Embed username and password into an RTSP URL if provided.
+    
+    Converts 'rtsp://host:port/path' to 'rtsp://user:pass@host:port/path'
+    """
+    if not username or not password:
+        return rtsp_url
+    if "://" not in rtsp_url:
+        return rtsp_url
+    scheme, rest = rtsp_url.split("://", 1)
+    # Only add credentials if not already present
+    if "@" not in rest:
+        return f"{scheme}://{username}:{password}@{rest}"
+    return rtsp_url
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +380,12 @@ def _capture_image(camera):
     rtsp = camera.get("rtsp_url")
     if image_bytes is None and rtsp:
         LOG.debug("Attempting RTSP capture for %s", cam_id)
+        # Embed credentials in RTSP URL if provided
+        rtsp_with_creds = _embed_rtsp_credentials(rtsp, user, password)
         if fmt == "jpeg":
-            image_bytes = run_ffmpeg_snapshot_jpeg(rtsp)
+            image_bytes = run_ffmpeg_snapshot_jpeg(rtsp_with_creds)
         else:
-            image_bytes = run_ffmpeg_snapshot(rtsp, user, password)
+            image_bytes = run_ffmpeg_snapshot(rtsp_with_creds)
 
     return image_bytes, remote_path
 
