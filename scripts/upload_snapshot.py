@@ -33,9 +33,6 @@ except Exception:
 
 DEFAULT_MIN_SIZE = 1024
 
-WEBP_PIPELINE_FFMPEG = "ffmpeg"
-WEBP_PIPELINE_CWEBP = "cwebp"
-
 LOG = logging.getLogger("uploader")
 
 # ---------------------------------------------------------------------------
@@ -157,24 +154,6 @@ def ffmpeg_image_to_webp_bytes(img_bytes, quality=85, timeout=30, ffmpeg_cmd=Non
     return _run_cmd(cmd, "ffmpeg-to-webp", input_bytes=img_bytes, timeout=timeout)
 
 
-def cwebp_image_to_webp_bytes(img_bytes, quality=85, timeout=30, cwebp_cmd=None):
-    """Convert image bytes to WebP using cwebp (pipe-to-pipe)."""
-    cwebp = _find_executable("cwebp", "CWEBP_CMD", cwebp_cmd)
-    if not cwebp:
-        LOG.error("cwebp not found. Install it or set CWEBP_CMD.")
-        return None
-    q = str(os.environ.get("CWEBP_QUALITY", str(quality)))
-    cmd = [cwebp, "-quiet", "-q", q, "-o", "-", "--", "-"]
-    return _run_cmd(cmd, "cwebp", input_bytes=img_bytes, timeout=timeout)
-
-
-def convert_to_webp_bytes(img_bytes, pipeline=WEBP_PIPELINE_FFMPEG):
-    """Convert non-WebP image bytes to WebP using the selected pipeline."""
-    if pipeline == WEBP_PIPELINE_CWEBP:
-        return cwebp_image_to_webp_bytes(img_bytes)
-    return ffmpeg_image_to_webp_bytes(img_bytes)
-
-
 # ---------------------------------------------------------------------------
 # Image utilities
 # ---------------------------------------------------------------------------
@@ -185,14 +164,6 @@ def is_webp_bytes(data):
     return bool(data and len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
 
 
-def ensure_webp_remote_path(remote_path):
-    """Normalize remote filename extension to .webp."""
-    if not remote_path:
-        return remote_path
-    base, _ = os.path.splitext(remote_path)
-    return base + ".webp"
-
-
 def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
     if not data or len(data) < min_size:
         if data:
@@ -201,13 +172,12 @@ def validate_image_bytes(data, min_size=DEFAULT_MIN_SIZE):
     return True
 
 
-def resolve_webp_pipeline(raw_value=None):
-    """Return normalized WebP conversion pipeline (ffmpeg|cwebp)."""
-    value = (raw_value or os.environ.get("WEBP_PIPELINE", WEBP_PIPELINE_FFMPEG)).strip().lower()
-    if value in (WEBP_PIPELINE_FFMPEG, WEBP_PIPELINE_CWEBP):
-        return value
-    LOG.warning("Unknown WEBP_PIPELINE=%s, falling back to %s", value, WEBP_PIPELINE_FFMPEG)
-    return WEBP_PIPELINE_FFMPEG
+def output_format_for(remote_path):
+    """Return 'webp' or 'jpeg' based on the remote_path file extension."""
+    ext = os.path.splitext(remote_path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        return "jpeg"
+    return "webp"
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +327,19 @@ class FTPSUploader:
 # ---------------------------------------------------------------------------
 
 
-def _capture_image(camera, webp_pipeline):
-    """Return (image_bytes, remote_path) for a camera, or (None, ...) on failure."""
+def _capture_image(camera):
+    """Return (image_bytes, remote_path) for a camera, or (None, ...) on failure.
+
+    The output format (WebP or JPEG) is determined by the file extension of
+    *remote_path* in the camera config. Any extension other than .jpg/.jpeg
+    produces WebP.
+    """
     cam_id = camera.get("id")
     user = camera.get("user")
     password = camera.get("pass")
     remote_path = camera.get("remote_path")
+    fmt = output_format_for(remote_path)
+    LOG.debug("Output format for %s: %s", cam_id, fmt)
     image_bytes = None
 
     # 1. Try HTTP snapshot first
@@ -371,16 +348,14 @@ def _capture_image(camera, webp_pipeline):
         LOG.debug("Fetching HTTP snapshot for %s", cam_id)
         image_bytes = fetch_http_snapshot(snapshot_url, user, password)
         if validate_image_bytes(image_bytes):
-            if not is_webp_bytes(image_bytes):
-                LOG.debug("Converting HTTP snapshot to WebP for %s using %s", cam_id, webp_pipeline)
-                webp_bytes = convert_to_webp_bytes(image_bytes, pipeline=webp_pipeline)
+            # Convert to WebP via ffmpeg if format requires it and source isn't already WebP
+            if fmt == "webp" and not is_webp_bytes(image_bytes):
+                LOG.debug("Converting HTTP snapshot to WebP for %s", cam_id)
+                webp_bytes = ffmpeg_image_to_webp_bytes(image_bytes)
                 if webp_bytes and validate_image_bytes(webp_bytes):
                     image_bytes = webp_bytes
-                    remote_path = ensure_webp_remote_path(remote_path)
                 else:
                     LOG.warning("WebP conversion failed for %s; uploading original bytes", cam_id)
-            else:
-                remote_path = ensure_webp_remote_path(remote_path)
         else:
             LOG.warning("HTTP snapshot failed for %s, falling back to RTSP", cam_id)
             image_bytes = None
@@ -389,14 +364,10 @@ def _capture_image(camera, webp_pipeline):
     rtsp = camera.get("rtsp_url")
     if image_bytes is None and rtsp:
         LOG.debug("Attempting RTSP capture for %s", cam_id)
-        if webp_pipeline == WEBP_PIPELINE_CWEBP:
-            jpeg_bytes = run_ffmpeg_snapshot_jpeg(rtsp)
-            if validate_image_bytes(jpeg_bytes):
-                image_bytes = cwebp_image_to_webp_bytes(jpeg_bytes)
+        if fmt == "jpeg":
+            image_bytes = run_ffmpeg_snapshot_jpeg(rtsp)
         else:
             image_bytes = run_ffmpeg_snapshot(rtsp, user, password)
-        if image_bytes:
-            remote_path = ensure_webp_remote_path(remote_path)
 
     return image_bytes, remote_path
 
@@ -434,7 +405,7 @@ def _save_local_copy(image_bytes, remote_path, cam_id, output_dir):
         LOG.exception("Failed to write local copy for %s", cam_id)
 
 
-def process_camera(camera, uploader, config, webp_pipeline=WEBP_PIPELINE_FFMPEG):
+def process_camera(camera, uploader, config):
     cam_id = camera.get("id")
     LOG.info("Processing camera %s", cam_id)
 
@@ -442,7 +413,7 @@ def process_camera(camera, uploader, config, webp_pipeline=WEBP_PIPELINE_FFMPEG)
         LOG.error("No remote_path configured for %s", cam_id)
         return False
 
-    image_bytes, remote_path = _capture_image(camera, webp_pipeline)
+    image_bytes, remote_path = _capture_image(camera)
 
     if not validate_image_bytes(image_bytes):
         LOG.error("Failed to capture valid image for %s", cam_id)
@@ -497,13 +468,10 @@ def main():
     except Exception:
         interval = None
 
-    webp_pipeline = resolve_webp_pipeline()
-    LOG.info("Using WebP pipeline: %s", webp_pipeline)
-
     config = {"output_dir": os.environ.get("OUTPUT_DIR")}
 
     def run_once():
-        results = [process_camera(cam, uploader, config, webp_pipeline=webp_pipeline) for cam in cameras]
+        results = [process_camera(cam, uploader, config) for cam in cameras]
         return all(results)
 
     if interval and interval > 0:
