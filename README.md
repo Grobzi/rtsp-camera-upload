@@ -31,6 +31,8 @@ Each entry in `cameras.json` supports the following fields:
 | `snapshot_url` | no | HTTP/HTTPS URL to fetch a still image; tried first, falls back to `rtsp_url` |
 | `user` | no | Username for RTSP and HTTP snapshot authentication |
 | `pass` | no | Password for RTSP and HTTP snapshot authentication |
+| `pixelate` | no | List of rectangular regions to pixelate (see [Pixelation](#pixelation) below) |
+| `pixelate_factor` | no | Default pixel block size for all regions of this camera (default: `10`) |
 
 Example:
 
@@ -47,10 +49,32 @@ Example:
     "rtsp_url": "rtsp://admin:secret@192.168.1.11:554/stream",
     "remote_path": "/webcams/cam2.webp",
     "user": "admin",
-    "pass": "secret"
+    "pass": "secret",
+    "pixelate_factor": 15,
+    "pixelate": [
+      { "x": 100, "y": 50, "width": 200, "height": 80 },
+      { "x": 400, "y": 300, "width": 120, "height": 120, "factor": 20 }
+    ]
   }
 ]
 ```
+
+Pixelation
+You can blur (pixelate) one or more rectangular areas of the captured image before upload — useful for hiding license plates, faces, or other sensitive content.
+
+Add a `pixelate` list to a camera entry. Each region has:
+
+| Field | Required | Description |
+|---|---|---|
+| `x` | yes | Left edge of the region in pixels |
+| `y` | yes | Top edge of the region in pixels |
+| `width` | yes | Width of the region in pixels |
+| `height` | yes | Height of the region in pixels |
+| `factor` | no | Pixel block size for this region; overrides the camera-level `pixelate_factor` |
+
+A larger `factor` produces coarser pixelation. The camera-level `pixelate_factor` sets the default for all regions of that camera (defaults to `10` if omitted).
+
+Pixelation requires [Pillow](https://python-pillow.org/), which is included in the dependencies.
 
 Output format
 The script selects the encoding pipeline based on the `remote_path` extension in `cameras.json`:

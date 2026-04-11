@@ -349,6 +349,99 @@ class FTPSUploader:
 
 
 # ---------------------------------------------------------------------------
+# Pixelation
+# ---------------------------------------------------------------------------
+
+
+def _pixelate_region(img, x, y, w, h, factor):
+    """Pixelate a rectangular region of a PIL Image in-place."""
+    factor = max(1, int(factor))
+    # Use Resampling.NEAREST in Pillow >= 10, fall back to NEAREST for older versions
+    _nearest = getattr(
+        getattr(img, "Resampling", None) or __import__("PIL.Image", fromlist=["Image"]).Image,
+        "NEAREST",
+        0,
+    )
+    region = img.crop((x, y, x + w, y + h))
+    small = region.resize((max(1, w // factor), max(1, h // factor)), _nearest)
+    img.paste(small.resize((w, h), _nearest), (x, y))
+
+
+def apply_pixelation(image_bytes, camera):
+    """Apply pixelation regions defined in the camera config.
+
+    Each entry in the ``pixelate`` list must have ``x``, ``y``,
+    ``width``, and ``height`` (in pixels).  An optional per-region
+    ``factor`` (pixel block size) overrides the camera-level
+    ``pixelate_factor`` (default: 10).
+
+    Returns modified image bytes, or the original bytes on failure.
+    """
+    regions = camera.get("pixelate")
+    if not regions:
+        return image_bytes
+
+    try:
+        from PIL import Image as _PILImage
+    except ImportError:
+        LOG.error("Pillow is required for pixelation. Install it: pip install pillow")
+        return image_bytes
+
+    try:
+        _nearest = getattr(
+            getattr(_PILImage, "Resampling", _PILImage),
+            "NEAREST",
+            0,
+        )
+        remote_path = camera.get("remote_path", "")
+        fmt = output_format_for(remote_path)
+        default_factor = int(camera.get("pixelate_factor", 10))
+
+        img = _PILImage.open(BytesIO(image_bytes))
+        img_w, img_h = img.size
+
+        for region in regions:
+            x = int(region.get("x", 0))
+            y = int(region.get("y", 0))
+            w = int(region.get("width", 0))
+            h = int(region.get("height", 0))
+            factor = int(region.get("factor", default_factor))
+
+            if w <= 0 or h <= 0:
+                LOG.warning("Skipping pixelation region with non-positive size: %s", region)
+                continue
+
+            # Clamp to image bounds
+            x = max(0, min(x, img_w - 1))
+            y = max(0, min(y, img_h - 1))
+            w = min(w, img_w - x)
+            h = min(h, img_h - y)
+            if w <= 0 or h <= 0:
+                continue
+
+            small = img.crop((x, y, x + w, y + h)).resize(
+                (max(1, w // factor), max(1, h // factor)), _nearest
+            )
+            img.paste(small.resize((w, h), _nearest), (x, y))
+            LOG.debug(
+                "Pixelated region x=%d y=%d w=%d h=%d factor=%d for %s",
+                x, y, w, h, factor, camera.get("id"),
+            )
+
+        buf = BytesIO()
+        if fmt == "jpeg":
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+            img.save(buf, format="JPEG", quality=85)
+        else:
+            img.save(buf, format="WEBP", quality=int(os.environ.get("FFMPEG_WEBP_QUALITY", "85")))
+        return buf.getvalue()
+    except Exception:
+        LOG.exception("Pixelation failed for %s; using original image", camera.get("id"))
+        return image_bytes
+
+
+# ---------------------------------------------------------------------------
 # Camera processing
 # ---------------------------------------------------------------------------
 
@@ -471,6 +564,8 @@ def process_camera(camera, uploader, config):
     if not validate_image_bytes(image_bytes):
         LOG.error("Failed to capture valid image for %s", cam_id)
         return False
+
+    image_bytes = apply_pixelation(image_bytes, camera)
 
     if not _upload_with_retries(uploader, image_bytes, remote_path, cam_id):
         return False
