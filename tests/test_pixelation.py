@@ -55,6 +55,16 @@ class TestApplyPixelationNoOp:
         result = apply_pixelation(data, camera)
         assert result is data
 
+    def test_corrupt_image_returns_none_when_regions_configured(self):
+        """Corrupt image data with pixelation configured must return None, not original bytes."""
+        camera = {
+            "id": "cam1",
+            "remote_path": "/cams/cam1.jpg",
+            "pixelate": [{"x": 0, "y": 0, "width": 50, "height": 50}],
+        }
+        result = apply_pixelation(b"not an image", camera)
+        assert result is None
+
 
 class TestApplyPixelationJPEG:
     def test_region_is_modified(self):
@@ -262,9 +272,10 @@ def test_real_image_pixelation():
         regions = json.loads(regions_env)
     else:
         img_size = Image.open(io.BytesIO(image_bytes)).size
-        regions = [{"x": 0, "y": 300, "width": img_size[0] // 4, "height": img_size[1] // 4}]
+        regions = [{"x": 0, "y": 150, "width": 2000, "height": 2000},
+                   {"x": 0, "y": 250, "width": 420, "height": 2000, "factor": 6}]
 
-    factor = int(os.environ.get("TEST_PIX_FACTOR", "15"))
+    factor = int(os.environ.get("TEST_PIX_FACTOR", "4"))
 
     camera = {
         "id": "test",

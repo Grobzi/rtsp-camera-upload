@@ -385,7 +385,7 @@ def apply_pixelation(image_bytes, camera):
         from PIL import Image as _PILImage
     except ImportError:
         LOG.error("Pillow is required for pixelation. Install it: pip install pillow")
-        return image_bytes
+        return None
 
     try:
         _nearest = getattr(
@@ -437,8 +437,8 @@ def apply_pixelation(image_bytes, camera):
             img.save(buf, format="WEBP", quality=int(os.environ.get("FFMPEG_WEBP_QUALITY", "85")))
         return buf.getvalue()
     except Exception:
-        LOG.exception("Pixelation failed for %s; using original image", camera.get("id"))
-        return image_bytes
+        LOG.exception("Pixelation failed for %s; skipping upload to protect privacy", camera.get("id"))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +566,9 @@ def process_camera(camera, uploader, config):
         return False
 
     image_bytes = apply_pixelation(image_bytes, camera)
+    if image_bytes is None:
+        LOG.error("Aborting upload for %s: pixelation failed", cam_id)
+        return False
 
     if not _upload_with_retries(uploader, image_bytes, remote_path, cam_id):
         return False
